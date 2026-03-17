@@ -50,6 +50,16 @@ def _quat_conj(q: np.ndarray) -> np.ndarray:
     return q * np.array([1.0, -1.0, -1.0, -1.0])
 
 
+def _rotate_vec_by_quat(v: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """
+    Rotate 3-vector v by unit quaternion q = (w, x, y, z).
+    Uses the sandwich product: v' = q ⊗ [0, v] ⊗ q*.
+    To express v in the frame of q, pass q* (conjugate) as q.
+    """
+    qv = np.array([0.0, v[0], v[1], v[2]])
+    return _quat_mul(_quat_mul(q, qv), _quat_conj(q))[1:]
+
+
 def _swing_twist_angle(q: np.ndarray, normal_idx: int) -> float:
     """
     Swing-twist decomposition: extract the twist angle around a cardinal axis.
@@ -102,6 +112,13 @@ def process(input_csv: str, output_csv: str, plane: str) -> None:
         offset_u = delta[_AXIS_IDX[ax0]]
         offset_v = delta[_AXIS_IDX[ax1]]
 
+        # ── Same offset expressed in gripper's local frame ───────────────────
+        # Rotating by q_gripper^{-1} removes the gripper's orientation so that
+        # a probe orbiting the gripper has a constant local-frame offset.
+        delta_local = _rotate_vec_by_quat(delta, _quat_conj(g_q))
+        offset_u_local = delta_local[_AXIS_IDX[ax0]]
+        offset_v_local = delta_local[_AXIS_IDX[ax1]]
+
         # ── Relative rotation: q_rel = q_gripper⁻¹ ⊗ q_probe ───────────────
         # Expresses the probe orientation in the gripper's local frame.
         q_rel = _quat_mul(_quat_conj(g_q), p_q)
@@ -116,6 +133,9 @@ def process(input_csv: str, output_csv: str, plane: str) -> None:
             f"offset_{ax1}_m":        offset_v,
             "rotation_rad":           rot_rad,
             "rotation_deg":           np.degrees(rot_rad),
+            # Gripper-local offsets used for velocity/acceleration (dropped later)
+            f"_local_{ax0}_m":        offset_u_local,
+            f"_local_{ax1}_m":        offset_v_local,
         })
 
     out = pd.DataFrame(rows)
@@ -125,12 +145,16 @@ def process(input_csv: str, output_csv: str, plane: str) -> None:
     # differences at the boundaries, respecting the actual (non-uniform) dt.
     t = out["timestamp_s"].to_numpy()
 
-    # Unwrap rotation before differentiating to avoid ±π discontinuity spikes.
+    # Translational velocity/acceleration are derived from the offset expressed
+    # in the gripper's co-rotating frame so that pure orbital motion of the
+    # probe around the gripper produces zero translational velocity.
+    # Rotational velocity is frame-invariant for a scalar angle and is
+    # differentiated from the unwrapped world-frame rotation as before.
     rot_unwrapped = np.unwrap(out["rotation_rad"].to_numpy())
 
     for col, signal in [
-        (f"offset_{ax0}_m", out[f"offset_{ax0}_m"].to_numpy()),
-        (f"offset_{ax1}_m", out[f"offset_{ax1}_m"].to_numpy()),
+        (f"offset_{ax0}_m", out[f"_local_{ax0}_m"].to_numpy()),   # gripper-local
+        (f"offset_{ax1}_m", out[f"_local_{ax1}_m"].to_numpy()),   # gripper-local
         ("rotation_rad",    rot_unwrapped),
     ]:
         vel = np.gradient(signal, t)
@@ -138,6 +162,8 @@ def process(input_csv: str, output_csv: str, plane: str) -> None:
         suffix = "_rad" if col == "rotation_rad" else "_m"
         out[f"vel_{col.replace(suffix, '')}{suffix}/s"]   = vel
         out[f"accel_{col.replace(suffix, '')}{suffix}/s2"] = acc
+
+    out = out.drop(columns=[f"_local_{ax0}_m", f"_local_{ax1}_m"])
 
     out.to_csv(output_csv, index=False, float_format="%.6f")
 
