@@ -119,6 +119,26 @@ def process(input_csv: str, output_csv: str, plane: str) -> None:
         })
 
     out = pd.DataFrame(rows)
+
+    # ── Velocity & acceleration via central differences ───────────────────────
+    # np.gradient uses central differences for interior points and one-sided
+    # differences at the boundaries, respecting the actual (non-uniform) dt.
+    t = out["timestamp_s"].to_numpy()
+
+    # Unwrap rotation before differentiating to avoid ±π discontinuity spikes.
+    rot_unwrapped = np.unwrap(out["rotation_rad"].to_numpy())
+
+    for col, signal in [
+        (f"offset_{ax0}_m", out[f"offset_{ax0}_m"].to_numpy()),
+        (f"offset_{ax1}_m", out[f"offset_{ax1}_m"].to_numpy()),
+        ("rotation_rad",    rot_unwrapped),
+    ]:
+        vel = np.gradient(signal, t)
+        acc = np.gradient(vel,    t)
+        suffix = "_rad" if col == "rotation_rad" else "_m"
+        out[f"vel_{col.replace(suffix, '')}{suffix}/s"]   = vel
+        out[f"accel_{col.replace(suffix, '')}{suffix}/s2"] = acc
+
     out.to_csv(output_csv, index=False, float_format="%.6f")
 
     print(f"Plane        : {plane.upper()}  (rotation extracted around {normal_lbl}-axis)")
