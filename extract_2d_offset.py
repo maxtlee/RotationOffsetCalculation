@@ -2,13 +2,28 @@
 extract_2d_offset.py
 ────────────────────
 Reads mocap CSV with 3D position + quaternion for a gripper and probe,
-then outputs the 2D position offset and rotation of the probe relative to
-the gripper, projected onto a user-selected plane.
+then outputs the 2D position offset, rotation, and their derivatives of the
+probe relative to the gripper, all expressed in the probe's own frame.
 
-Position offset  : probe_pos - gripper_pos, projected onto PLANE.
-Rotation offset  : relative rotation (q_gripper⁻¹ × q_probe), decomposed
-                   into the twist angle around the axis normal to PLANE
-                   via swing-twist decomposition.
+All quantities are computed in the probe (object) frame
+────────────────────────────────────────────────────────
+  Position offset  : (probe_pos − gripper_pos) rotated into the probe's frame,
+                     then projected onto PLANE.
+
+  Why probe frame?
+    • Probe orbiting the gripper (both co-rotating as a rigid body): the
+      probe-frame offset is constant  →  translational velocity = 0.
+    • Probe spinning about its own centre (fixed position relative to gripper,
+      but changing orientation): the probe-frame offset rotates  →
+      translational velocity ≠ 0.
+
+  Rotation offset  : swing-twist angle of q_gripper⁻¹ ⊗ q_probe around the
+                     axis normal to PLANE.  Frame-invariant scalar.
+
+  Angular velocity : ω = (r × v) / ‖r‖²  where r and v are the 2-D
+                     probe-frame offset and its time derivative respectively.
+                     This is the angular velocity of the gripper-to-probe
+                     direction as seen from the probe's own frame.
 """
 
 import numpy as np
@@ -20,8 +35,6 @@ INPUT_CSV  = "mocap_raw.csv"
 OUTPUT_CSV = "offset_2d.csv"
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Maps each plane to the two in-plane axes and the index of the normal axis
-# (0=X, 1=Y, 2=Z) used to extract the twist rotation component.
 _PLANE_CFG = {
     "xy": {"axes": ("x", "y"), "normal_idx": 2},   # normal = +Z
     "yz": {"axes": ("y", "z"), "normal_idx": 0},   # normal = +X
@@ -66,20 +79,15 @@ def _swing_twist_angle(q: np.ndarray, normal_idx: int) -> float:
 
     Given q = (w, x, y, z) and the index of the twist axis (0=X, 1=Y, 2=Z),
     returns the signed twist angle in radians ∈ (−π, π].
-
-    The twist quaternion is: t = normalize(w,  n̂ · (x,y,z) · n̂)
-    i.e. only the component of the imaginary part along the axis is kept.
     """
-    q_vec = q[1:]                          # (x, y, z)
+    q_vec = q[1:]
     proj = np.zeros(3)
-    proj[normal_idx] = q_vec[normal_idx]   # project onto normal axis
+    proj[normal_idx] = q_vec[normal_idx]
     twist = np.array([q[0], proj[0], proj[1], proj[2]])
     norm = np.linalg.norm(twist)
     if norm < 1e-10:
         return 0.0
     twist /= norm
-    # angle = 2 * atan2( sin(θ/2), cos(θ/2) )  where the imaginary component
-    # along the normal axis is sin(θ/2).
     return 2.0 * np.arctan2(twist[normal_idx + 1], twist[0])
 
 
@@ -91,84 +99,76 @@ def process(input_csv: str, output_csv: str, plane: str) -> None:
         raise ValueError(f"PLANE must be one of {list(_PLANE_CFG)}, got '{plane}'")
 
     cfg        = _PLANE_CFG[plane]
-    ax0, ax1   = cfg["axes"]        # e.g. "x", "y"
-    normal_idx = cfg["normal_idx"]  # index of axis normal to the plane
+    ax0, ax1   = cfg["axes"]
+    normal_idx = cfg["normal_idx"]
     normal_lbl = "xyz"[normal_idx].upper()
 
     df = pd.read_csv(input_csv)
 
     rows = []
     for _, r in df.iterrows():
-        # ── 3D positions ────────────────────────────────────────────────────
         g_pos = np.array([r["gripper_x_m"], r["gripper_y_m"], r["gripper_z_m"]])
         p_pos = np.array([r["probe_x_m"],   r["probe_y_m"],   r["probe_z_m"]])
 
-        # ── Quaternions as (w, x, y, z) ─────────────────────────────────────
         g_q = np.array([r["gripper_qw"], r["gripper_qx"], r["gripper_qy"], r["gripper_qz"]])
         p_q = np.array([r["probe_qw"],   r["probe_qx"],   r["probe_qy"],   r["probe_qz"]])
 
-        # ── 2D position offset: project (probe - gripper) onto plane ────────
-        delta = p_pos - g_pos
-        offset_u = delta[_AXIS_IDX[ax0]]
-        offset_v = delta[_AXIS_IDX[ax1]]
+        # ── Position offset in probe's frame ────────────────────────────────
+        # Rotating the world-frame offset by q_probe⁻¹ expresses it in the
+        # probe's own coordinate system.  When the probe and gripper move as
+        # a rigid body (co-rotation), this vector is constant.  When the probe
+        # spins about its own centre at a fixed position, this vector rotates.
+        delta       = p_pos - g_pos
+        delta_probe = _rotate_vec_by_quat(delta, _quat_conj(p_q))
 
-        # ── Same offset expressed in gripper's local frame ───────────────────
-        # Rotating by q_gripper^{-1} removes the gripper's orientation so that
-        # a probe orbiting the gripper has a constant local-frame offset.
-        delta_local = _rotate_vec_by_quat(delta, _quat_conj(g_q))
-        offset_u_local = delta_local[_AXIS_IDX[ax0]]
-        offset_v_local = delta_local[_AXIS_IDX[ax1]]
+        offset_u = delta_probe[_AXIS_IDX[ax0]]
+        offset_v = delta_probe[_AXIS_IDX[ax1]]
 
-        # ── Relative rotation: q_rel = q_gripper⁻¹ ⊗ q_probe ───────────────
-        # Expresses the probe orientation in the gripper's local frame.
-        q_rel = _quat_mul(_quat_conj(g_q), p_q)
-
-        # ── 2D rotation: twist angle around the plane's normal axis ─────────
+        # ── Relative rotation: swing-twist angle of q_gripper⁻¹ ⊗ q_probe ──
+        # Frame-invariant scalar — unaffected by the frame choice above.
+        q_rel   = _quat_mul(_quat_conj(g_q), p_q)
         rot_rad = _swing_twist_angle(q_rel, normal_idx)
 
         rows.append({
-            "timestamp_s":            r["timestamp_s"],
-            "frame":                  int(r["frame"]),
-            f"offset_{ax0}_m":        offset_u,
-            f"offset_{ax1}_m":        offset_v,
-            "rotation_rad":           rot_rad,
-            "rotation_deg":           np.degrees(rot_rad),
-            # Gripper-local offsets used for velocity/acceleration (dropped later)
-            f"_local_{ax0}_m":        offset_u_local,
-            f"_local_{ax1}_m":        offset_v_local,
+            "timestamp_s":     r["timestamp_s"],
+            "frame":           int(r["frame"]),
+            f"offset_{ax0}_m": offset_u,
+            f"offset_{ax1}_m": offset_v,
+            "rotation_rad":    rot_rad,
+            "rotation_deg":    np.degrees(rot_rad),
         })
 
     out = pd.DataFrame(rows)
 
-    # ── Velocity & acceleration via central differences ───────────────────────
+    # ── Derivatives ───────────────────────────────────────────────────────────
     # np.gradient uses central differences for interior points and one-sided
-    # differences at the boundaries, respecting the actual (non-uniform) dt.
-    t = out["timestamp_s"].to_numpy()
+    # differences at the boundaries, respecting non-uniform sample intervals.
+    t  = out["timestamp_s"].to_numpy()
+    ru = out[f"offset_{ax0}_m"].to_numpy()
+    rv = out[f"offset_{ax1}_m"].to_numpy()
 
-    # Translational velocity/acceleration are derived from the offset expressed
-    # in the gripper's co-rotating frame so that pure orbital motion of the
-    # probe around the gripper produces zero translational velocity.
-    # Rotational velocity is frame-invariant for a scalar angle and is
-    # differentiated from the unwrapped world-frame rotation as before.
-    rot_unwrapped = np.unwrap(out["rotation_rad"].to_numpy())
+    vu = np.gradient(ru, t)
+    vv = np.gradient(rv, t)
 
-    for col, signal in [
-        (f"offset_{ax0}_m", out[f"_local_{ax0}_m"].to_numpy()),   # gripper-local
-        (f"offset_{ax1}_m", out[f"_local_{ax1}_m"].to_numpy()),   # gripper-local
-        ("rotation_rad",    rot_unwrapped),
-    ]:
-        vel = np.gradient(signal, t)
-        acc = np.gradient(vel,    t)
-        suffix = "_rad" if col == "rotation_rad" else "_m"
-        out[f"vel_{col.replace(suffix, '')}{suffix}/s"]   = vel
-        out[f"accel_{col.replace(suffix, '')}{suffix}/s2"] = acc
+    out[f"vel_offset_{ax0}_m/s"]   = vu
+    out[f"vel_offset_{ax1}_m/s"]   = vv
+    out[f"accel_offset_{ax0}_m/s2"] = np.gradient(vu, t)
+    out[f"accel_offset_{ax1}_m/s2"] = np.gradient(vv, t)
 
-    out = out.drop(columns=[f"_local_{ax0}_m", f"_local_{ax1}_m"])
+    # ── Angular velocity: ω = (r × v) / ‖r‖² ────────────────────────────────
+    # r and v are already in the same frame (probe frame), so this is
+    # consistent.  Gives the angular velocity of the gripper-to-probe direction
+    # vector as observed from the probe's own frame.
+    r_sq  = ru**2 + rv**2
+    omega = np.where(r_sq > 1e-12, (ru * vv - rv * vu) / r_sq, 0.0)
+
+    out["vel_rotation_rad/s"]      = omega
+    out["accel_rotation_rad/s2"]   = np.gradient(omega, t)
 
     out.to_csv(output_csv, index=False, float_format="%.6f")
 
-    print(f"Plane        : {plane.upper()}  (rotation extracted around {normal_lbl}-axis)")
-    print(f"Position axes: {ax0.upper()}, {ax1.upper()}")
+    print(f"Plane        : {plane.upper()}  (rotation around {normal_lbl}-axis)")
+    print(f"Position axes: {ax0.upper()}, {ax1.upper()}  —  expressed in probe frame")
     print(f"Frames       : {len(out)}")
     print(f"Output       : {output_csv}")
     print()
